@@ -10,7 +10,7 @@ import {SafeERC20} from "openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"
 import {AccessControl} from "openzeppelin/contracts/access/AccessControl.sol";
 import {Math} from "openzeppelin/contracts/utils/math/Math.sol";
 
-import {IFeed} from "./vendor/IEcruFeed.sol";
+import {IOracle} from "./vendor/IOracle.sol";
 import {IPool} from "./vendor/IAuraPool.sol";
 import {IVault} from "./interfaces/IVault.sol";
 
@@ -251,8 +251,8 @@ contract AuraVault is IVault, ERC4626, AccessControl {
     }
 
     function _previewReward(uint256 balReward, uint256 auraReward, VaultConfig memory config) private view returns (uint256 amount) {
-        amount = balReward * IFeed(feed).price(BAL) / IFeed(feed).price(asset());
-        amount = amount + auraReward * IFeed(feed).price(AURA) / IFeed(feed).price(asset());
+        amount = balReward * IOracle(feed).spot(BAL) / IOracle(feed).spot(asset());
+        amount = amount + auraReward * IOracle(feed).spot(AURA) / IOracle(feed).spot(asset());
         amount = amount * (INCENTIVE_BASIS - config.claimerIncentive) / INCENTIVE_BASIS;
     }
 
