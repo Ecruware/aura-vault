@@ -7,22 +7,18 @@ import "src/AuraVault.sol";
 
 contract AuraVaultTest is Test {
     AuraVault vault;
-        address rewardPool_ = address(0x1);
-        address asset_ = address(0x2);
-        address rewardToken_ = address(0x3);
-        address secondaryRewardToken_ = address(0x4);
-        address feed_ = address(0x5);
-        uint32 maxClaimerIncentive_ = 9500;
-        uint32 maxLockerIncentive_ = 9000;
-        string tokenName_ = "AuraVault";
-        string tokenSymbol_ = "AUVA";
+    address rewardPool_ = address(0x1);
+    address asset_ = address(0x2);
+    address feed_ = address(0x3);
+    uint32 maxClaimerIncentive_ = 100;
+    uint32 maxLockerIncentive_ = 100;
+    string tokenName_ = "Aura Vault";
+    string tokenSymbol_ = "auraVault";
 
     function setUp() public {
         vault = new AuraVault(
             rewardPool_,
             asset_,
-            rewardToken_,
-            secondaryRewardToken_,
             feed_,
             maxClaimerIncentive_,
             maxLockerIncentive_,

@@ -9,6 +9,7 @@ import {ERC20Permit} from "openzeppelin/contracts/token/ERC20/extensions/ERC20Pe
 import {SafeERC20} from "openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "openzeppelin/contracts/access/AccessControl.sol";
 
+import {AuraMath} from "./vendor/AuraMath.sol";
 import {IFeed} from "./vendor/IEcruFeed.sol";
 import {IPool} from "./vendor/IAuraPool.sol";
 import {IVault} from "./interfaces/IVault.sol";
@@ -20,17 +21,12 @@ bytes32 constant VAULT_ADMIN_ROLE = keccak256("VAULT_ADMIN_ROLE");
 /// @notice `A 4626 vault that compounds rewards from an Aura RewardsPool
 contract AuraVault is IVault, ERC4626, AccessControl {
     using SafeERC20 for IERC20;
+    using AuraMath for uint256;
 
     /* ========== Constants ========== */
 
     /// @notice The Aura pool distributing rewards
     address public immutable rewardPool;
-
-    /// @notice The primary reward token distributed in the Aura pool
-    address public immutable rewardToken;
-
-    /// @notice The secondary reward token distributed in the Aura pool
-    address public immutable secondaryRewardToken;
 
     /// @notice The max permitted claimer incentive
     uint32 public immutable maxClaimerIncentive;
@@ -42,7 +38,19 @@ contract AuraVault is IVault, ERC4626, AccessControl {
     address public immutable feed;
 
     /// @notice The incentive rates denomination
-    uint256 public constant INCENTIVE_BASIS = 10000;
+    uint256 private constant INCENTIVE_BASIS = 10000;
+
+    /// @notice The BAL token
+    address private constant BAL = 0xba100000625a3754423978a60c9317c58a424e3D;
+
+    /// @notice The AURA token
+    address private constant AURA = 0xC0c293ce456fF0ED870ADd98a0828Dd4d2903DBF;
+
+    // Utilities for AURA mining calcs
+    uint256 private constant EMISSIONS_MAX_SUPPLY = 5e25; // 50m
+    uint256 private constant INIT_MINT_AMOUNT = 5e25; // 50m
+    uint256 private constant TOTAL_CLIFFS = 500;
+    uint256 private constant REDUCTION_PER_CLIFF = 1e23; 
 
     /* ========== Storage ========== */
 
@@ -74,19 +82,15 @@ contract AuraVault is IVault, ERC4626, AccessControl {
     constructor(
         address rewardPool_,
         address asset_,
-        address rewardToken_,
-        address secondaryRewardToken_,
         address feed_,
         uint32 maxClaimerIncentive_,
         uint32 maxLockerIncentive_,
         string memory tokenName_,
         string memory tokenSymbol_
     ) ERC4626(IERC20(asset_)) ERC20(tokenName_, tokenSymbol_) {
-        IERC20(asset()).safeApprove(rewardPool_, type(uint256).max);
+        IERC20(asset_).safeApprove(rewardPool_, type(uint256).max);
 
         rewardPool = rewardPool_;
-        rewardToken = rewardToken_;
-        secondaryRewardToken = secondaryRewardToken_;
         feed = feed_;
         maxClaimerIncentive = maxClaimerIncentive_;
         maxLockerIncentive = maxLockerIncentive_;
@@ -98,7 +102,7 @@ contract AuraVault is IVault, ERC4626, AccessControl {
      * @notice Total amount of the underlying asset that is "managed" by Vault.
      */
     function totalAssets() public view virtual override(IERC4626, ERC4626) returns (uint256){
-        return IPool(rewardPool).balanceOf(address(this));
+        return IPool(rewardPool).balanceOf(address(this)) + previewReward();
     }
 
     /**
@@ -186,35 +190,72 @@ contract AuraVault is IVault, ERC4626, AccessControl {
      * @param amounts An array of reward amounts to be claimed ordered as [rewardToken, secondaryRewardToken]
      * @param maxAmountIn The max amount of WETH to be sent to the Vault
      */
-    function claim(uint256[] memory amounts, uint256 maxAmountIn) external returns (uint256) {
+    function claim(uint256[] memory amounts, uint256 maxAmountIn) external returns (uint256 amountIn) {
         // Claim rewards from Aura reward pool
         IPool(rewardPool).getReward();
 
         // Compute lpToken amount to be sent to the Vault
         VaultConfig memory _config = vaultConfig;
-        uint256 _amountIn;
-        uint256 _rewardTokenOut = amounts[0] * _config.lockerIncentive / INCENTIVE_BASIS;
-        uint256 _secondaryRewardTokenOut = amounts[1] * _config.lockerIncentive / INCENTIVE_BASIS;
-        _amountIn = _rewardTokenOut * IFeed(feed).price(rewardToken) / IFeed(feed).price(asset());
-        _amountIn = _amountIn + _secondaryRewardTokenOut * IFeed(feed).price(secondaryRewardToken) / IFeed(feed).price(asset());
-        _amountIn = _amountIn * _config.claimerIncentive / INCENTIVE_BASIS;
+        amountIn = _previewReward(amounts[0], amounts[1], _config);
 
         // Transfer lpToken to Vault
-        require(_amountIn <= maxAmountIn, "!Slippage");
-        IERC20(asset()).safeTransferFrom(msg.sender, address(this), _amountIn);
+        require(amountIn <= maxAmountIn, "!Slippage");
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), amountIn);
 
         // Compound lpToken into "asset" balance
-        IPool(rewardPool).deposit(_amountIn, address(this));
+        IPool(rewardPool).deposit(amountIn, address(this));
 
         // Collect "Locker" rewards
-        IERC20(rewardToken).safeTransfer(_config.lockerRewards, amounts[0] - _rewardTokenOut);
-        IERC20(secondaryRewardToken).safeTransfer(_config.lockerRewards, amounts[1] - _secondaryRewardTokenOut);
+        IERC20(BAL).safeTransfer(_config.lockerRewards, amounts[0] * _config.lockerIncentive / INCENTIVE_BASIS);
+        IERC20(AURA).safeTransfer(_config.lockerRewards, amounts[1] * _config.lockerIncentive / INCENTIVE_BASIS);
 
         // Transfer reward tokens to caller
-        IERC20(rewardToken).safeTransfer(msg.sender, _rewardTokenOut);
-        IERC20(secondaryRewardToken).safeTransfer(msg.sender, _secondaryRewardTokenOut);
+        IERC20(BAL).safeTransfer(msg.sender, amounts[0]);
+        IERC20(AURA).safeTransfer(msg.sender, amounts[1]);
 
-        emit Claimed(msg.sender, amounts[0], amounts[1], _amountIn);
+        emit Claimed(msg.sender, amounts[0], amounts[1], amountIn);
+    }
+
+    function previewReward() public view returns (uint256 amount) {
+        VaultConfig memory config = vaultConfig;
+        uint256 balReward = IPool(rewardPool).earned(address(this)) + IERC20(BAL).balanceOf(address(this));
+        uint256 auraReward = _previewMining(balReward) + IERC20(AURA).balanceOf(address(this));
+        amount = _previewReward(balReward, auraReward, config);
+    }
+
+    function _previewReward(uint256 balReward, uint256 auraReward, VaultConfig memory config) private view returns (uint256 amount) {
+        amount = balReward * IFeed(feed).price(BAL) / IFeed(feed).price(asset());
+        amount = amount + auraReward * IFeed(feed).price(AURA) / IFeed(feed).price(asset());
+        amount = amount * (INCENTIVE_BASIS - config.claimerIncentive) / INCENTIVE_BASIS;
+    }
+
+    /**
+     * @dev Calculates the amount of AURA to mint based on the BAL supply schedule
+     * See https://etherscan.io/token/0xc0c293ce456ff0ed870add98a0828dd4d2903dbf#code
+     */
+    function _previewMining(uint256 _amount) private view returns (uint256 amount) {
+        uint256 supply = IERC20(AURA).totalSupply();
+        uint256 minterMinted = 0; // TODO: fetch
+        uint256 emissionsMinted = supply - INIT_MINT_AMOUNT - minterMinted;
+
+        uint256 cliff = emissionsMinted.div(REDUCTION_PER_CLIFF);
+
+        // e.g. 100 < 500
+        if (cliff < TOTAL_CLIFFS) {
+            // e.g. (new) reduction = (500 - 100) * 2.5 + 700 = 1700;
+            // e.g. (new) reduction = (500 - 250) * 2.5 + 700 = 1325;
+            // e.g. (new) reduction = (500 - 400) * 2.5 + 700 = 950;
+            uint256 reduction = TOTAL_CLIFFS.sub(cliff).mul(5).div(2).add(700);
+            // e.g. (new) amount = 1e19 * 1700 / 500 =  34e18;
+            // e.g. (new) amount = 1e19 * 1325 / 500 =  26.5e18;
+            // e.g. (new) amount = 1e19 * 950 / 500  =  19e17;
+            amount = _amount.mul(reduction).div(TOTAL_CLIFFS);
+            // e.g. amtTillMax = 5e25 - 1e25 = 4e25
+            uint256 amtTillMax = EMISSIONS_MAX_SUPPLY.sub(emissionsMinted);
+            if (amount > amtTillMax) {
+                amount = amtTillMax;
+            }
+        }
     }
 
     /* ========== Admin ========== */
