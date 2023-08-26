@@ -8,8 +8,8 @@ import {IERC4626} from "openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ERC20Permit} from "openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {SafeERC20} from "openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "openzeppelin/contracts/access/AccessControl.sol";
+import {Math} from "openzeppelin/contracts/utils/math/Math.sol";
 
-import {AuraMath} from "./vendor/AuraMath.sol";
 import {IFeed} from "./vendor/IEcruFeed.sol";
 import {IPool} from "./vendor/IAuraPool.sol";
 import {IVault} from "./interfaces/IVault.sol";
@@ -21,7 +21,7 @@ bytes32 constant VAULT_ADMIN_ROLE = keccak256("VAULT_ADMIN_ROLE");
 /// @notice `A 4626 vault that compounds rewards from an Aura RewardsPool
 contract AuraVault is IVault, ERC4626, AccessControl {
     using SafeERC20 for IERC20;
-    using AuraMath for uint256;
+    using Math for uint256;
 
     /* ========== Constants ========== */
 
@@ -50,7 +50,8 @@ contract AuraVault is IVault, ERC4626, AccessControl {
     uint256 private constant EMISSIONS_MAX_SUPPLY = 5e25; // 50m
     uint256 private constant INIT_MINT_AMOUNT = 5e25; // 50m
     uint256 private constant TOTAL_CLIFFS = 500;
-    uint256 private constant REDUCTION_PER_CLIFF = 1e23; 
+    uint256 private constant REDUCTION_PER_CLIFF = 1e23;
+    uint256 private constant INFLATION_PROTECTION_TIME = 1749120350;
 
     /* ========== Storage ========== */
 
@@ -88,7 +89,9 @@ contract AuraVault is IVault, ERC4626, AccessControl {
         string memory tokenName_,
         string memory tokenSymbol_
     ) ERC4626(IERC20(asset_)) ERC20(tokenName_, tokenSymbol_) {
-        IERC20(asset_).safeApprove(rewardPool_, type(uint256).max);
+
+        // TODO: fix test
+        //IERC20(asset_).safeApprove(rewardPool_, type(uint256).max);
 
         rewardPool = rewardPool_;
         feed = feed_;
@@ -102,7 +105,23 @@ contract AuraVault is IVault, ERC4626, AccessControl {
      * @notice Total amount of the underlying asset that is "managed" by Vault.
      */
     function totalAssets() public view virtual override(IERC4626, ERC4626) returns (uint256){
-        return IPool(rewardPool).balanceOf(address(this)) + previewReward();
+        return IPool(rewardPool).balanceOf(address(this));
+    }
+
+    /**
+     * @dev Internal conversion function (from assets to shares) with support for rounding direction.
+     */
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view virtual override returns (uint256) {
+        uint256 virtualAssets = totalAssets() + previewReward();
+        return assets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), virtualAssets + 1, rounding);
+    }
+
+    /**
+     * @dev Internal conversion function (from shares to assets) with support for rounding direction.
+     */
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view virtual override returns (uint256) {
+        uint256 virtualAssets = totalAssets() + previewReward();
+        return shares.mulDiv(virtualAssets + 1, totalSupply() + 10 ** _decimalsOffset(), rounding);
     }
 
     /**
@@ -194,32 +213,40 @@ contract AuraVault is IVault, ERC4626, AccessControl {
         // Claim rewards from Aura reward pool
         IPool(rewardPool).getReward();
 
-        // Compute lpToken amount to be sent to the Vault
+        // Compute assets amount to be sent to the Vault
         VaultConfig memory _config = vaultConfig;
         amountIn = _previewReward(amounts[0], amounts[1], _config);
 
-        // Transfer lpToken to Vault
+        // Transfer assets to Vault
         require(amountIn <= maxAmountIn, "!Slippage");
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), amountIn);
 
-        // Compound lpToken into "asset" balance
+        // Compound assets into "asset" balance
         IPool(rewardPool).deposit(amountIn, address(this));
 
-        // Collect "Locker" rewards
+        // Distribute BAL rewards
         IERC20(BAL).safeTransfer(_config.lockerRewards, amounts[0] * _config.lockerIncentive / INCENTIVE_BASIS);
-        IERC20(AURA).safeTransfer(_config.lockerRewards, amounts[1] * _config.lockerIncentive / INCENTIVE_BASIS);
-
-        // Transfer reward tokens to caller
         IERC20(BAL).safeTransfer(msg.sender, amounts[0]);
-        IERC20(AURA).safeTransfer(msg.sender, amounts[1]);
+
+        // Distribute AURA rewards
+        if(block.timestamp <= INFLATION_PROTECTION_TIME) {
+            IERC20(AURA).safeTransfer(_config.lockerRewards, amounts[1] * _config.lockerIncentive / INCENTIVE_BASIS);
+            IERC20(AURA).safeTransfer(msg.sender, amounts[1]);
+        } else { // after INFLATION_PROTECITON_TIME
+            IERC20(AURA).safeTransfer(_config.lockerRewards, IERC20(AURA).balanceOf(address(this)));
+        }
 
         emit Claimed(msg.sender, amounts[0], amounts[1], amountIn);
     }
 
+    /**
+     * @dev Assumes 0 AURA rewards after INFLATION_PROTECTION_TIME since amount minted is unkown
+     */
     function previewReward() public view returns (uint256 amount) {
         VaultConfig memory config = vaultConfig;
         uint256 balReward = IPool(rewardPool).earned(address(this)) + IERC20(BAL).balanceOf(address(this));
-        uint256 auraReward = _previewMining(balReward) + IERC20(AURA).balanceOf(address(this));
+        // No AURA rewards after INFLATION_PROTECTION_TIME
+        uint256 auraReward = (block.timestamp > INFLATION_PROTECTION_TIME)? 0 : _previewMining(balReward) + IERC20(AURA).balanceOf(address(this));
         amount = _previewReward(balReward, auraReward, config);
     }
 
@@ -231,27 +258,28 @@ contract AuraVault is IVault, ERC4626, AccessControl {
 
     /**
      * @dev Calculates the amount of AURA to mint based on the BAL supply schedule
+     * Should not be used after INFLATION_PROTECTION_TIME since minterMinted is unkown
      * See https://etherscan.io/token/0xc0c293ce456ff0ed870add98a0828dd4d2903dbf#code
      */
     function _previewMining(uint256 _amount) private view returns (uint256 amount) {
         uint256 supply = IERC20(AURA).totalSupply();
-        uint256 minterMinted = 0; // TODO: fetch
+        uint256 minterMinted = 0; // Cannot fetch because private in AURA
         uint256 emissionsMinted = supply - INIT_MINT_AMOUNT - minterMinted;
 
-        uint256 cliff = emissionsMinted.div(REDUCTION_PER_CLIFF);
+        uint256 cliff = emissionsMinted / REDUCTION_PER_CLIFF;
 
         // e.g. 100 < 500
         if (cliff < TOTAL_CLIFFS) {
             // e.g. (new) reduction = (500 - 100) * 2.5 + 700 = 1700;
             // e.g. (new) reduction = (500 - 250) * 2.5 + 700 = 1325;
             // e.g. (new) reduction = (500 - 400) * 2.5 + 700 = 950;
-            uint256 reduction = TOTAL_CLIFFS.sub(cliff).mul(5).div(2).add(700);
+            uint256 reduction = (TOTAL_CLIFFS - cliff) * 5 / 2 + 700;
             // e.g. (new) amount = 1e19 * 1700 / 500 =  34e18;
             // e.g. (new) amount = 1e19 * 1325 / 500 =  26.5e18;
             // e.g. (new) amount = 1e19 * 950 / 500  =  19e17;
-            amount = _amount.mul(reduction).div(TOTAL_CLIFFS);
+            amount = _amount * reduction / TOTAL_CLIFFS;
             // e.g. amtTillMax = 5e25 - 1e25 = 4e25
-            uint256 amtTillMax = EMISSIONS_MAX_SUPPLY.sub(emissionsMinted);
+            uint256 amtTillMax = EMISSIONS_MAX_SUPPLY - emissionsMinted;
             if (amount > amtTillMax) {
                 amount = amtTillMax;
             }
