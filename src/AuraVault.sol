@@ -135,6 +135,7 @@ contract AuraVault is IVault, ERC4626, AccessControl {
         _deposit(_msgSender(), receiver, assets, shares);
 
         // Deposit  in reward pool
+        IERC20(asset()).safeApprove(rewardPool, assets);
         IPool(rewardPool).deposit(assets, address(this));
 
         return shares;
@@ -151,6 +152,7 @@ contract AuraVault is IVault, ERC4626, AccessControl {
         _deposit(_msgSender(), receiver, assets, shares);
 
         // Deposit assets in reward pool
+        IERC20(asset()).safeApprove(rewardPool, assets);
         IPool(rewardPool).deposit(assets, address(this));
 
         return assets;
@@ -222,6 +224,7 @@ contract AuraVault is IVault, ERC4626, AccessControl {
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), amountIn);
 
         // Compound assets into "asset" balance
+        IERC20(asset()).safeApprove(rewardPool, amountIn);
         IPool(rewardPool).deposit(amountIn, address(this));
 
         // Distribute BAL rewards
